@@ -1,0 +1,559 @@
+rules_version = '2';
+
+// Reglas de seguridad de Firestore para SelvaCheck (plan Spark).
+// Publicarlas en Firebase Console > Firestore Database > Reglas, o con
+// `firebase deploy --only firestore:rules`.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Utilidades ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function authEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    function emailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/usuarios/$(uid);
+    }
+
+    function preRegistrationPath(email) {
+      return /databases/$(database)/documents/preregistros/$(email);
+    }
+
+    function coursePath(courseId) {
+      return /databases/$(database)/documents/cursos/$(courseId);
+    }
+
+    function enrollmentPath(courseId, email) {
+      return /databases/$(database)/documents/inscripciones/$(courseId + '_' + email);
+    }
+
+    function isTeacher() {
+      return signedIn()
+        && exists(userPath(request.auth.uid))
+        && get(userPath(request.auth.uid)).data.rol == 'docente';
+    }
+
+    // Debe coincidir con AppConfig.institutionalDomain.
+    function institutional(email) {
+      return email.matches('^[^@]+@udla[.]edu[.]co$');
+    }
+
+    function validCode(code) {
+      return code is string && code.matches('^[0-9]{6,12}$');
+    }
+
+    function validName(name) {
+      return name is string && name.size() > 0 && name.size() <= 120;
+    }
+
+    function isCourseOwner(courseId) {
+      return signedIn()
+        && get(coursePath(courseId)).data.docenteId == request.auth.uid;
+    }
+
+    function courseAcceptsStudents(courseId) {
+      return get(coursePath(courseId)).data.estado != 'inactivo';
+    }
+
+    function isActiveStudentOf(courseId) {
+      return emailVerified()
+        && exists(enrollmentPath(courseId, authEmail()))
+        && get(enrollmentPath(courseId, authEmail())).data.estado == 'activo';
+    }
+
+    // ---------- Usuarios ----------
+    // Los docentes se crean a mano desde la consola
+    // (rol: 'docente', vinculado: true).
+    match /usuarios/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isTeacher());
+
+      // Un estudiante crea su propio perfil al registrarse, sin vincular.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(
+             ['nombre', 'codigo', 'email', 'rol', 'vinculado', 'creadoEn'])
+        && request.resource.data.rol == 'estudiante'
+        && request.resource.data.vinculado == false
+        && request.resource.data.email == authEmail()
+        && institutional(request.resource.data.email)
+        && validName(request.resource.data.nombre)
+        && validCode(request.resource.data.codigo)
+        && request.resource.data.creadoEn == request.time;
+
+      // Vinculación: solo con correo verificado y si existe un pre-registro
+      // con el mismo correo y código.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && emailVerified()
+        && resource.data.rol == 'estudiante'
+        && resource.data.vinculado == false
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['vinculado', 'vinculadoEn'])
+        && request.resource.data.vinculado == true
+        && request.resource.data.vinculadoEn == request.time
+        && exists(preRegistrationPath(resource.data.email))
+        && get(preRegistrationPath(resource.data.email)).data.codigo
+             == resource.data.codigo;
+
+      // El estudiante vincula su cuenta a un teléfono, solo la primera vez.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.rol == 'estudiante'
+        && !('dispositivo' in resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['dispositivo'])
+        && request.resource.data.dispositivo.keys()
+             .hasOnly(['id', 'modelo', 'vinculadoEn'])
+        && request.resource.data.dispositivo.id is string
+        && request.resource.data.dispositivo.id.size() >= 16
+        && request.resource.data.dispositivo.id.size() <= 64
+        && request.resource.data.dispositivo.modelo is string
+        && request.resource.data.dispositivo.modelo.size() <= 80
+        && request.resource.data.dispositivo.vinculadoEn == request.time;
+
+      // Un docente desvincula el teléfono de un estudiante (por ejemplo, si lo
+      // cambió o reinstaló la app).
+      allow update: if isTeacher()
+        && resource.data.rol == 'estudiante'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['dispositivo'])
+        && !('dispositivo' in request.resource.data);
+
+      // Cada usuario edita sus datos personales y académicos. El correo, el
+      // código y el rol no se pueden cambiar desde la app.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['nombre', 'telefono', 'programa', 'dependencia'])
+        && validName(request.resource.data.nombre)
+        && (!('telefono' in request.resource.data)
+            || (request.resource.data.telefono is string
+                && request.resource.data.telefono.matches('^[0-9 +()-]{0,20}$')))
+        && (!('programa' in request.resource.data)
+            || (request.resource.data.programa is string
+                && request.resource.data.programa.size() <= 80))
+        && (!('dependencia' in request.resource.data)
+            || (request.resource.data.dependencia is string
+                && request.resource.data.dependencia.size() <= 80));
+
+      // El docente guarda su tolerancia por defecto para iniciar clase.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.rol == 'docente'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['toleranciaPresenteMin'])
+        && request.resource.data.toleranciaPresenteMin in [5, 10, 15, 20];
+
+      // Solo se puede borrar un perfil propio que no llegó a vincularse.
+      allow delete: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.vinculado == false;
+    }
+
+    // ---------- Pre-registros ----------
+    // Los crea el docente al inscribir a un estudiante. Id = correo en minúsculas.
+    match /preregistros/{email} {
+      function validPreRegistration(d) {
+        return d.keys().hasOnly(['nombre', 'codigo', 'creadoPor', 'creadoEn'])
+          && validName(d.nombre)
+          && validCode(d.codigo);
+      }
+
+      allow get: if signedIn()
+        && (isTeacher() || (emailVerified() && authEmail() == email));
+
+      allow create: if isTeacher()
+        && institutional(email)
+        && validPreRegistration(request.resource.data)
+        && request.resource.data.creadoPor == request.auth.uid
+        && request.resource.data.creadoEn == request.time;
+
+      // Solo quien lo creó puede corregirlo.
+      allow update: if isTeacher()
+        && resource.data.creadoPor == request.auth.uid
+        && validPreRegistration(request.resource.data)
+        && request.resource.data.creadoPor == resource.data.creadoPor
+        && request.resource.data.creadoEn == resource.data.creadoEn;
+
+      allow list, delete: if false;
+    }
+
+    // ---------- Cursos ----------
+    match /cursos/{courseId} {
+      // Un encuentro semanal: día (1 = lunes … 7), inicio < fin en minutos
+      // desde la medianoche, y salón.
+      function validMeeting(m) {
+        return m is map
+          && m.keys().hasOnly(['dia', 'inicio', 'fin', 'bloque', 'salon'])
+          && m.dia is int && m.dia >= 1 && m.dia <= 7
+          && m.inicio is int && m.fin is int
+          && m.inicio >= 0 && m.fin <= 1440 && m.inicio < m.fin
+          && m.bloque is string && m.bloque.size() <= 40
+          && m.salon is string && m.salon.size() > 0 && m.salon.size() <= 40;
+      }
+
+      // De 1 a 2 encuentros por semana (límite oficial; debe coincidir con
+      // AppConfig.maxMeetingsPerWeek), sin cruces el mismo día.
+      function validMeetings(list) {
+        return list is list && list.size() >= 1 && list.size() <= 2
+          && validMeeting(list[0])
+          && (list.size() == 1
+              || (validMeeting(list[1])
+                  && (list[0].dia != list[1].dia
+                      || list[0].fin <= list[1].inicio
+                      || list[1].fin <= list[0].inicio)));
+      }
+
+      function validCourseCommon(d) {
+        return d.keys().hasOnly(['nombre', 'codigo', 'grupo', 'periodo',
+               'docenteId', 'docenteNombre', 'encuentros', 'radioMetros',
+               'color', 'estado', 'creadoEn', 'actualizadoEn',
+               // Horario único de cursos creados antes de los encuentros.
+               'dias', 'horaInicio', 'horaFin', 'bloque', 'salon'])
+          && d.keys().hasAll(['nombre', 'codigo', 'grupo', 'periodo',
+               'docenteId', 'radioMetros', 'estado'])
+          && d.nombre is string && d.nombre.size() > 0 && d.nombre.size() <= 100
+          && d.codigo is string && d.codigo.size() <= 20
+          && d.grupo is string && d.grupo.size() <= 30
+          && d.periodo is string && d.periodo.matches('^[0-9]{4}-[12]$')
+          && d.radioMetros is int
+          && d.radioMetros >= 20 && d.radioMetros <= 100
+          && d.estado in ['borrador', 'activo', 'inactivo'];
+      }
+
+      // Los cursos nuevos usan encuentros.
+      function validNewCourse(d) {
+        return validCourseCommon(d)
+          && validMeetings(d.encuentros)
+          && !('dias' in d);
+      }
+
+      // Al actualizar: encuentros válidos, o un curso anterior que conserva
+      // su horario único sin cambiarlo.
+      function validCourseUpdate(d, before) {
+        return validCourseCommon(d)
+          && (('encuentros' in d && validMeetings(d.encuentros)
+                && !('dias' in d))
+              || (!('encuentros' in d) && 'dias' in before
+                  && d.dias == before.dias
+                  && d.horaInicio == before.horaInicio
+                  && d.horaFin == before.horaFin));
+      }
+
+      // El docente ve sus cursos; el estudiante, los publicados donde está
+      // inscrito y activo.
+      allow get: if signedIn()
+        && (resource.data.docenteId == request.auth.uid
+            || (resource.data.estado != 'borrador'
+                && isActiveStudentOf(courseId)));
+
+      allow list: if signedIn()
+        && resource.data.docenteId == request.auth.uid;
+
+      allow create: if isTeacher()
+        && request.resource.data.docenteId == request.auth.uid
+        && validNewCourse(request.resource.data)
+        && request.resource.data.creadoEn == request.time;
+
+      allow update: if signedIn()
+        && resource.data.docenteId == request.auth.uid
+        && request.resource.data.docenteId == resource.data.docenteId
+        && request.resource.data.creadoEn == resource.data.creadoEn
+        && validCourseUpdate(request.resource.data, resource.data);
+
+      allow delete: if false;
+    }
+
+    // ---------- Inscripciones ----------
+    // Id = '{cursoId}_{correo}'. Los ids de curso generados por Firestore no
+    // contienen '_', así que el curso se puede leer del id.
+    match /inscripciones/{enrollmentId} {
+      function courseIdFromId() {
+        return enrollmentId.split('_')[0];
+      }
+
+      function validEnrollment(d) {
+        return d.keys().hasOnly(['cursoId', 'email', 'nombre', 'codigo',
+               'estado', 'agregadoEn', 'actualizadoEn', 'motivoBaja',
+               'observacionBaja', 'bajaEn', 'nota'])
+          && (!('nota' in d)
+              || (d.nota is number && d.nota >= 0 && d.nota <= 5))
+          && institutional(d.email)
+          && validName(d.nombre)
+          && validCode(d.codigo)
+          && d.estado in ['activo', 'retirado']
+          && (!('motivoBaja' in d)
+              || d.motivoBaja in ['inasistencia', 'retiro_voluntario',
+                                  'error_registro'])
+          && (!('observacionBaja' in d)
+              || (d.observacionBaja is string
+                  && d.observacionBaja.size() <= 300));
+      }
+
+      allow get: if signedIn()
+        && (isCourseOwner(courseIdFromId())
+            || (emailVerified() && resource.data.email == authEmail()));
+
+      allow list: if signedIn()
+        && ((emailVerified() && resource.data.email == authEmail())
+            || isCourseOwner(resource.data.cursoId));
+
+      allow create: if isCourseOwner(request.resource.data.cursoId)
+        && enrollmentId == request.resource.data.cursoId + '_'
+                           + request.resource.data.email
+        && courseAcceptsStudents(request.resource.data.cursoId)
+        && request.resource.data.estado == 'activo'
+        && validEnrollment(request.resource.data);
+
+      allow update: if isCourseOwner(resource.data.cursoId)
+        && request.resource.data.cursoId == resource.data.cursoId
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.codigo == resource.data.codigo
+        && validEnrollment(request.resource.data)
+        // Reactivar a un estudiante retirado exige que el curso esté abierto.
+        && (request.resource.data.estado != 'activo'
+            || resource.data.estado == 'activo'
+            || courseAcceptsStudents(resource.data.cursoId));
+
+      allow delete: if false;
+    }
+
+    // ---------- Sesiones de clase ----------
+    function sessionPath(sessionId) {
+      return /databases/$(database)/documents/sesiones/$(sessionId);
+    }
+
+    function qrPath(sessionId) {
+      return /databases/$(database)/documents/sesiones/$(sessionId)/privado/qr;
+    }
+
+    // El token es válido si es el vigente o el anterior y el docente lo
+    // renovó hace menos de 30 s (AppConfig.qrTokenGrace).
+    function validToken(sessionId, token) {
+      return token is string && token.size() > 0
+        && (get(qrPath(sessionId)).data.valor == token
+            || get(qrPath(sessionId)).data.anterior == token)
+        && request.time
+             <= get(qrPath(sessionId)).data.emitidoEn + duration.value(30, 's');
+    }
+
+    function windowOpen(session) {
+      return session.estado == 'abierta'
+        && request.time <= session.inicio + duration.value(
+             session.ventanaPresenteMin + session.ventanaTardeMin, 'm');
+    }
+
+    match /sesiones/{sessionId} {
+      function validSession(d) {
+        return d.keys().hasOnly(['cursoId', 'docenteId', 'cursoNombre',
+               'docenteNombre', 'salon', 'numero', 'inicio',
+               'ventanaPresenteMin', 'ventanaTardeMin', 'estado',
+               'ubicacion', 'radioMetros', 'wifi', 'cerradaEn', 'resumen'])
+          && d.ventanaPresenteMin in [5, 10, 15, 20]
+          && d.ventanaTardeMin is int
+          && d.ventanaTardeMin >= 0 && d.ventanaTardeMin <= 15
+          && d.numero is int && d.numero > 0
+          && d.ubicacion.lat is number && d.ubicacion.lng is number
+          && d.ubicacion.precision is number
+          && d.radioMetros is int
+          && d.radioMetros >= 20 && d.radioMetros <= 100
+          && d.wifi is list && d.wifi.size() <= 30;
+      }
+
+      allow get, list: if signedIn()
+        && (resource.data.docenteId == request.auth.uid
+            || isActiveStudentOf(resource.data.cursoId));
+
+      allow create: if isCourseOwner(request.resource.data.cursoId)
+        && request.resource.data.docenteId == request.auth.uid
+        && get(coursePath(request.resource.data.cursoId)).data.estado
+             == 'activo'
+        && request.resource.data.estado == 'abierta'
+        && request.resource.data.inicio == request.time
+        && validSession(request.resource.data);
+
+      function validSummary(d) {
+        return !('resumen' in d)
+          || (d.resumen is map
+              && d.resumen.keys().hasOnly(['esperados', 'presentes', 'tarde',
+                   'ausentes', 'justificados', 'revision']));
+      }
+
+      // Se puede cerrar (una sola vez) y actualizar el resumen de conteos.
+      allow update: if signedIn()
+        && resource.data.docenteId == request.auth.uid
+        && validSummary(request.resource.data)
+        && ((request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['estado', 'cerradaEn', 'resumen'])
+             && resource.data.estado == 'abierta'
+             && request.resource.data.estado == 'cerrada'
+             && request.resource.data.cerradaEn == request.time)
+            || request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['resumen']));
+
+      allow delete: if false;
+
+      // Token del QR y lista de inscritos: solo el docente de la clase.
+      // Se usa getAfter para permitir crearlos en el mismo lote que la sesión.
+      match /privado/{docId} {
+        allow read: if signedIn()
+          && get(sessionPath(sessionId)).data.docenteId == request.auth.uid;
+
+        allow write: if signedIn()
+          && getAfter(sessionPath(sessionId)).data.docenteId
+               == request.auth.uid
+          && getAfter(sessionPath(sessionId)).data.estado == 'abierta'
+          && ((docId == 'qr'
+                && request.resource.data.keys()
+                     .hasOnly(['valor', 'anterior', 'emitidoEn'])
+                && request.resource.data.valor is string
+                && request.resource.data.valor.size() >= 16
+                && request.resource.data.anterior is string
+                && request.resource.data.emitidoEn == request.time)
+              || (docId == 'inscritos'
+                && !exists(/databases/$(database)/documents/sesiones/$(sessionId)/privado/inscritos)
+                && request.resource.data.keys().hasOnly(['emails'])
+                && request.resource.data.emails is list));
+      }
+    }
+
+    // ---------- Asistencias ----------
+    // Id = '{sesionId}_{correo}': una sola marca por estudiante y clase.
+    match /asistencias/{recordId} {
+      function sessionIdFromId() {
+        return recordId.split('_')[0];
+      }
+
+      function isOwnRecordId() {
+        return emailVerified()
+          && recordId == sessionIdFromId() + '_' + authEmail();
+      }
+
+      function isSessionTeacher(sessionId) {
+        return signedIn()
+          && get(sessionPath(sessionId)).data.docenteId == request.auth.uid;
+      }
+
+      allow get: if signedIn()
+        && (isOwnRecordId() || isSessionTeacher(sessionIdFromId()));
+
+      allow list: if signedIn()
+        && ((emailVerified() && resource.data.email == authEmail())
+            || isCourseOwner(resource.data.cursoId));
+
+      // El estudiante marca su asistencia: QR vigente, ventana abierta e
+      // inscripción activa. Si falla GPS o WiFi, debe quedar "pendiente".
+      function studentMarks() {
+        return signedIn()
+        && isOwnRecordId()
+        && request.resource.data.keys().hasOnly(['sesionId', 'cursoId',
+             'email', 'uid', 'nombre', 'codigo', 'marcadoEn', 'token',
+             'gpsOk', 'wifiOk', 'distanciaM', 'precisionM',
+             'ubicacionSimulada', 'bssid', 'dispositivoId', 'revision'])
+        // Solo desde el teléfono vinculado a la cuenta.
+        && request.resource.data.dispositivoId
+             == get(userPath(request.auth.uid)).data.dispositivo.id
+        && request.resource.data.sesionId == sessionIdFromId()
+        && request.resource.data.email == authEmail()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.cursoId
+             == get(sessionPath(sessionIdFromId())).data.cursoId
+        && windowOpen(get(sessionPath(sessionIdFromId())).data)
+        && isActiveStudentOf(request.resource.data.cursoId)
+        && request.resource.data.codigo == get(enrollmentPath(
+             request.resource.data.cursoId, authEmail())).data.codigo
+        && request.resource.data.nombre == get(enrollmentPath(
+             request.resource.data.cursoId, authEmail())).data.nombre
+        && validToken(sessionIdFromId(), request.resource.data.token)
+        && request.resource.data.marcadoEn == request.time
+        && request.resource.data.gpsOk is bool
+        && request.resource.data.wifiOk is bool
+        && request.resource.data.ubicacionSimulada is bool
+        && (request.resource.data.revision == 'pendiente'
+            || (request.resource.data.revision == 'no_requerida'
+                && request.resource.data.gpsOk == true
+                && request.resource.data.wifiOk == true));
+      }
+
+      // Estado asignado a mano por el docente (corrección, justificación o
+      // marcado sin QR).
+      function validManual(d) {
+        return d.estadoManual in ['presente', 'tarde', 'ausente', 'justificado']
+          && d.motivoManual is string
+          && d.motivoManual.size() > 0 && d.motivoManual.size() <= 300
+          && d.corregidoPor == request.auth.uid
+          && d.corregidoEn == request.time;
+      }
+
+      // El docente crea el registro de un inscrito que no marcó.
+      function teacherCreatesManual() {
+        return isSessionTeacher(sessionIdFromId())
+          && request.resource.data.keys().hasOnly(['sesionId', 'cursoId',
+               'email', 'nombre', 'codigo', 'estadoManual', 'motivoManual',
+               'corregidoPor', 'corregidoEn'])
+          && request.resource.data.sesionId == sessionIdFromId()
+          && recordId == sessionIdFromId() + '_' + request.resource.data.email
+          && request.resource.data.cursoId
+               == get(sessionPath(sessionIdFromId())).data.cursoId
+          && exists(enrollmentPath(request.resource.data.cursoId,
+               request.resource.data.email))
+          && validManual(request.resource.data);
+      }
+
+      allow create: if studentMarks() || teacherCreatesManual();
+
+      // El docente aprueba o rechaza una marca, o corrige su estado.
+      allow update: if isSessionTeacher(resource.data.sesionId)
+        && ((request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['revision', 'revisadoPor', 'revisadoEn'])
+             && request.resource.data.revision in ['aprobada', 'rechazada']
+             && request.resource.data.revisadoPor == request.auth.uid
+             && request.resource.data.revisadoEn == request.time)
+            || (request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['estadoManual', 'motivoManual', 'corregidoPor',
+                            'corregidoEn'])
+                && validManual(request.resource.data)));
+
+      allow delete: if false;
+    }
+
+    // Todo lo demás está cerrado.
+    // ---------- Fotos de perfil (opcionales) ----------
+    // JPEG reducido en el teléfono y guardado como texto base64 (sin Storage,
+    // que exige el plan Blaze). El id es el correo para que las listas de los
+    // cursos, que se identifican por correo, encuentren la foto.
+    match /fotos/{email} {
+      function ownsPhoto() {
+        return signedIn() && emailVerified() && authEmail() == email;
+      }
+
+      function validPhoto(d) {
+        return d.keys().hasOnly(['imagen', 'actualizadoEn'])
+          && d.imagen is string
+          && d.imagen.size() > 0
+          && d.imagen.size() <= 150000
+          && d.actualizadoEn == request.time;
+      }
+
+      // La ven su dueño y los docentes (las reglas no pueden limitarla al
+      // docente de un curso sin una consulta).
+      allow get: if ownsPhoto() || isTeacher();
+      allow list: if false;
+      allow create, update: if ownsPhoto() && validPhoto(request.resource.data);
+      allow delete: if ownsPhoto();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

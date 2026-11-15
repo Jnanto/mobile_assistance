@@ -1,0 +1,24 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "selvacheck-1d238",
+          "appId": "1:176514296335:android:5e03f2dbb9e41d0828517a",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "selvacheck-1d238",
+          "configurations": {
+            "android": "1:176514296335:android:5e03f2dbb9e41d0828517a"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
