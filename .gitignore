@@ -47,5 +47,25 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 
-# Memoria del asistente (local)
+# Memoria y artefactos locales
 CLAUDE.md
+comparaciones/
+
+# Environment and secrets
+.env
+.env.*
+*.keystore
+*.jks
+key.properties
+local.properties
+
+# Firebase local / debug logs
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
